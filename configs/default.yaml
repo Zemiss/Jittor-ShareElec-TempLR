@@ -1,0 +1,64 @@
+datasets:
+  - dataset1
+  - dataset2
+
+run:
+  model: mynet
+  default_command: submit
+  dataset: dataset1
+
+paths:
+  data_dir: ./data_A
+  model_dir: ./models
+  output_dir: ./outputs
+  submission_dir: ./outputs/submission
+  log_dir: ./outputs/logs
+
+common:
+  seed: 2411273
+  use_cuda: 1
+
+mynet:
+  num_neighbors: 30
+  hidden_size: 64
+  dropout: 0.1
+  max_co_items: 20
+  epochs: 20
+  batch_size: 200
+  early_stop: 1
+  lr: 0.0001
+  weight_decay: 0.0
+  objective: sampled_softmax
+  selection_metric: MRR
+
+baseline:
+  num_neighbors: 30
+  hidden_size: 64
+  dropout: 0.1
+  max_co_items: 20
+  epochs: 20
+  batch_size: 200
+  early_stop: 1
+  lr: 0.0001
+  weight_decay: 0.0
+  objective: bpr
+  selection_metric: AP
+
+train:
+  extra_eval_metrics: true
+  blend_mode: none
+  blend_alpha: -1.0
+  tune_val_samples: 5000
+  val_candidates: 100
+  train_candidates: 32
+  heuristic_decay: 0.0
+  binary_aux_weight: 0.0
+
+submission:
+  seed: 1
+  zip_name: result.zip
+
+local_mrr:
+  val_ratio: 0.15
+  num_candidates: 100
+  max_rows: 5000

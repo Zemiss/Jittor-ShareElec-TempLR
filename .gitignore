@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Build / package artifacts
+build/
+dist/
+*.egg-info/
+
+# Training artifacts
+/saved_models/
+/models/
+/outputs/
+/submission/
+/logs/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local tooling files
+.codex
+
+# Internal planning docs
+docs/
+
+AGENTS.md
