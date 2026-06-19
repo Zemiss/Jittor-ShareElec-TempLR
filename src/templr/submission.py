@@ -91,6 +91,7 @@ def build_parser(config, argv=None):
     parser.add_argument('--heuristic_decay', type=float, default=train.get('heuristic_decay', 0.0))
     parser.add_argument('--binary_aux_weight', type=float, default=train.get('binary_aux_weight', 0.0))
     parser.add_argument('--mynet_heuristic_alpha', type=float, default=train.get('mynet_heuristic_alpha', 1.0))
+    parser.add_argument('--num_negatives', type=int, default=model_cfg.get('num_negatives', 1))
     parser.add_argument('--model_name', type=str, default=model_name, choices=['baseline', 'mynet'])
     parser.add_argument('--dropout', type=float, default=model_cfg.get('dropout', 0.1))
     parser.add_argument('--shortcut_scale', type=float, default=model_cfg.get('shortcut_scale', 0.35))
@@ -159,6 +160,7 @@ def main(argv=None):
             '--heuristic_decay', str(strategy['heuristic_decay']),
             '--binary_aux_weight', str(args.binary_aux_weight),
             '--mynet_heuristic_alpha', str(args.mynet_heuristic_alpha),
+            '--num_negatives', str(args.num_negatives),
             '--model_name', args.model_name,
             '--dropout', str(args.dropout),
             '--shortcut_scale', str(args.shortcut_scale),

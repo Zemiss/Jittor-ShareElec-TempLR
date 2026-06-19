@@ -94,6 +94,7 @@ def train_baseline(
     model_tag='BASELINE',
     selection_metric='MRR',
     extra_eval_metrics=True,
+    num_negatives=1,
 ):
     selection_metric = ''.join(ch for ch in str(selection_metric).upper() if ch.isalnum())
     extra_eval_metrics = bool(extra_eval_metrics)
@@ -125,7 +126,10 @@ def train_baseline(
                 continue
 
             pos_item = jt.Var(dst).unsqueeze(-1)
-            neg_item = jt.Var(neg_dst).unsqueeze(-1)
+            if len(neg_dst.shape) == 1:
+                neg_item = jt.Var(neg_dst).reshape((pos_item.shape[0], -1))
+            else:
+                neg_item = jt.Var(neg_dst)
             test_dst = jt.cat([pos_item, neg_item], dim=-1)
             dst_last_update_time = build_dst_last_update_times(
                 jt,
@@ -134,14 +138,26 @@ def train_baseline(
                 test_dst,
             )
 
-            loss, _, _ = model.calculate_loss(
-                src_neighb_seq=jt.Var(src_neighb_seq),
-                src_neighb_seq_len=jt.Var(neighbor_num),
-                src_neighb_interact_times=jt.Var(src_neighb_interact_times),
-                cur_pred_times=jt.Var(t),
-                test_dst=test_dst,
-                dst_last_update_times=dst_last_update_time,
-            )
+            if neg_item.shape[1] == 1:
+                loss, _, _ = model.calculate_loss(
+                    src_neighb_seq=jt.Var(src_neighb_seq),
+                    src_neighb_seq_len=jt.Var(neighbor_num),
+                    src_neighb_interact_times=jt.Var(src_neighb_interact_times),
+                    cur_pred_times=jt.Var(t),
+                    test_dst=test_dst,
+                    dst_last_update_times=dst_last_update_time,
+                )
+            else:
+                pos_score, neg_score = model.predict(
+                    src_neighb_seq=jt.Var(src_neighb_seq),
+                    src_neighb_seq_len=jt.Var(neighbor_num),
+                    src_neighb_interact_times=jt.Var(src_neighb_interact_times),
+                    cur_pred_times=jt.Var(t),
+                    test_dst=test_dst,
+                    dst_last_update_times=dst_last_update_time,
+                )
+                pos_score = pos_score.unsqueeze(1).broadcast(neg_item.shape).flatten()
+                loss = model.loss_fct(pos_score, neg_score)
 
             optimizer.zero_grad()
             optimizer.step(loss)

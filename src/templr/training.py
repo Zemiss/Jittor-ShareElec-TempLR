@@ -135,6 +135,7 @@ def build_parser(config, argv=None):
     parser.add_argument('--heuristic_decay', type=float, default=train_cfg.get('heuristic_decay', 0.0))
     parser.add_argument('--binary_aux_weight', type=float, default=train_cfg.get('binary_aux_weight', 0.0))
     parser.add_argument('--mynet_heuristic_alpha', type=float, default=train_cfg.get('mynet_heuristic_alpha', 1.0))
+    parser.add_argument('--num_negatives', type=int, default=model_cfg.get('num_negatives', 1))
     parser.add_argument('--log_dir', type=str, default=get(config, 'paths', 'log_dir', './outputs/logs'))
     parser.add_argument('--seed', type=int, default=common.get('seed', 1), help='Random seed')
     parser.add_argument('--num_neighbors', type=int, default=model_cfg.get('num_neighbors', 30))
@@ -235,9 +236,11 @@ def main(argv=None):
     baseline_family = is_baseline_family(model_name)
     bpr_objective = uses_bpr_objective(model_name, args.objective)
 
+    bpr_num_negatives = max(1, int(args.num_negatives if model_name == 'mynet' else 1))
+
     if bpr_objective:
         train_sampler = None
-        train_loader = TemporalDataLoader(train_data, batch_size=args.batch_size, neg_sampling_ratio=1.0)
+        train_loader = TemporalDataLoader(train_data, batch_size=args.batch_size, neg_sampling_ratio=float(bpr_num_negatives))
         val_loader = TemporalDataLoader(val_data, batch_size=args.batch_size, neg_sampling_ratio=1.0)
     else:
         train_feature_store = TemporalFeatureStore(
@@ -363,6 +366,8 @@ def main(argv=None):
         f'(patience={args.early_stop}, selection_metric={args.selection_metric}, '
         f'extra_eval_metrics={args.extra_eval_metrics})...'
     )
+    if bpr_objective and model_name == 'mynet' and bpr_num_negatives != 1:
+        print(f'Using {bpr_num_negatives} random negatives per positive for mynet BPR training.')
     best_val_neural_scores = None
     if bpr_objective:
         best_score = train_baseline(
@@ -384,6 +389,7 @@ def main(argv=None):
             model_tag,
             args.selection_metric,
             args.extra_eval_metrics,
+            bpr_num_negatives,
         )
     else:
         best_score, best_val_neural_scores = train_model(
