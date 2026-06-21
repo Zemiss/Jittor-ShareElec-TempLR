@@ -75,28 +75,6 @@ def row_minmax(scores):
     return (scores - min_v) / denom
 
 
-def uncertainty_tiebreak(scores, helper_scores, weight=0.02, margin=0.05):
-    """Small helper-score boost only for rows where the neural top choice is uncertain."""
-    weight = float(weight)
-    margin = float(margin)
-    if weight <= 0:
-        return scores
-
-    neural = row_minmax(scores)
-    helper = row_minmax(helper_scores)
-    if neural.shape[1] < 2:
-        return neural
-
-    sorted_scores = np.sort(neural, axis=1)
-    top_margin = sorted_scores[:, -1] - sorted_scores[:, -2]
-    if margin <= 0:
-        row_weight = np.full((neural.shape[0], 1), weight, dtype=np.float32)
-    else:
-        uncertainty = np.clip(1.0 - top_margin / margin, 0.0, 1.0)
-        row_weight = (weight * uncertainty).astype(np.float32)[:, None]
-    return row_minmax(neural + row_weight * helper)
-
-
 class TemporalFeatureStore:
     """Strictly time-aware features for candidate link ranking."""
 
@@ -234,7 +212,7 @@ class TemporalFeatureStore:
 
 
 class CandidateSampler:
-    """Builds positive-first candidate lists for local MRR and hard negatives."""
+    """Builds positive-first candidate lists with random negatives."""
 
     def __init__(self, src, dst, t, feature_store, seed=1):
         self.src = np.asarray(src, dtype=np.int32)
@@ -262,12 +240,10 @@ class CandidateSampler:
         candidates = np.empty((len(src), num_candidates), dtype=np.int32)
         candidates[:, 0] = positive_dst
 
-        for row_idx, (src_i, pos_i, time_i) in enumerate(zip(src, positive_dst, t)):
+        for row_idx, pos_i in enumerate(positive_dst):
             selected = {int(pos_i)}
             negatives = []
 
-            self._add_source_history(negatives, selected, src_i, time_i, num_candidates)
-            self._add_recent_popular(negatives, selected, time_i, num_candidates)
             self._add_random(negatives, selected, num_candidates)
 
             candidates[row_idx, 1:] = np.asarray(negatives[:num_candidates - 1], dtype=np.int32)
@@ -443,11 +419,7 @@ def check_data_main(argv=None) -> None:
     parser.add_argument('--config', type=str, default=config_path)
     parser.add_argument('--data_dir', type=str, default=get(config, 'paths', 'data_dir', './data_A'))
     parser.add_argument('--datasets', type=str, nargs='+', default=config.get('datasets', ['dataset1', 'dataset2']))
-    parser.add_argument('--log_dir', type=str, default=get(config, 'paths', 'log_dir', './outputs/logs'))
     args = parser.parse_args(argv)
-
-    log_name = f'check_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    install_tee(os.path.join(args.log_dir, 'check_data', log_name))
 
     for ds in args.datasets:
         check_dataset(args.data_dir, ds)

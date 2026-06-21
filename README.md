@@ -50,10 +50,11 @@ Jittor/
 
 ## 环境配置
 
-本项目使用 Python 3.7，主要依赖包括 numpy、jittor、jittor-geometric 和 PyYAML。
+本项目使用 Python 3.7，主要依赖包括 numpy、pandas、scikit-learn、jittor、jittor-geometric 和 PyYAML。
 
 ```bash
-conda create -n Jittor python=3.7 -y
+conda create -n jittor_env python=3.7 -y
+conda activate jittor_env
 pip install -r requirements.txt
 ```
 
@@ -76,27 +77,30 @@ python scripts/run.py train --dataset dataset1 --use_cuda 0
 
 ## 模型结构
 
-工程支持两种主模型，并加入时间感知启发式特征进行候选排序融合：
+工程支持两种主模型。`baseline` 保持原始实现不动，`mynet` 用于在 baseline 基础上做轻量实验：
 
 - `baseline`：JittorGeometric 提供的基线模型。
-- `mynet`：CTG-Ranker 实验网络，使用因果时间邻居编码、候选 destination 历史编码、pairwise history features 和 MLP re-ranker。
+- `mynet`：与 baseline 相同的 CRAFT 主干副本，额外在训练/预测流程中支持更多负样本和 learned rerank 后处理。
+
+当前最有效的 `mynet` 改动是 `use_rerank: true`。reranker 会使用神经网络候选分数，以及时间感知的重复交互、候选流行度、近期历史命中等特征，训练一个轻量 LogisticRegression 二阶段排序器，对 100 个候选进行重排。
 
 核心模块：
 
-- `src/templr/training.py`：训练、验证、推理主流程。
+- `src/templr/training.py`：训练、验证、推理主流程；包含 `mynet` learned rerank 逻辑。
 - `src/templr/runtime.py`：训练循环、验证和批量推理工具。
 - `src/templr/models/factory.py`：根据参数构建 `baseline` 或 `mynet`。
 - `src/templr/models/baseline.py`：baseline 网络定义。
 - `src/templr/models/mynet.py`：mynet 网络定义。
 - `src/templr/baseline.py`：baseline/mynet 共用的训练、验证和比赛推理流程。
 - `src/templr/core.py`：候选采样、时间特征、本地 MRR、日志与格式检查。
-- `src/templr/submission.py`：多 seed 训练、预测集成和提交包生成。
+- `src/templr/submission.py`：多数据集训练、预测和提交包生成。
 
 ## 训练配置
 
 默认参数集中写在 `configs/default.yaml`。常用字段如下：
 
-- `paths.model_dir`：模型权重输出目录，默认 `./models`。
+- `paths.save_model_dir`：模型权重输出目录，默认 `./models`。
+- `paths.use_model_dir`：测试时读取模型权重的目录，默认 `./models`。
 - `paths.output_dir`：单独运行训练时的预测结果输出目录，默认 `./outputs`。
 - `paths.submission_dir`：提交文件目录，默认 `./outputs/submission`。
 - `run.default_command`：不带子命令运行 `scripts/run.py` 时默认执行的命令，当前为 `submit`。
@@ -104,16 +108,15 @@ python scripts/run.py train --dataset dataset1 --use_cuda 0
 - `mynet.*`：`mynet` 的模型参数，网络定义位于 `src/templr/models/mynet.py`。
 - `baseline.*`：`baseline` 的模型参数，网络定义位于 `src/templr/models/baseline.py`。
 - `mynet.hidden_size` / `baseline.hidden_size`：模型隐藏层维度。
-- `mynet.shortcut_scale` / `baseline.shortcut_scale`：时间与重复交互捷径特征的缩放系数。
-- `mynet.time_frequencies` / `baseline.time_frequencies`：Fourier 时间编码频率数量。
 - `mynet.max_co_items` / `baseline.max_co_items`：co-occurrence 特征使用的源节点近期历史数量。
-- `train.epochs`：最大训练轮数。
-- `train.lr`：学习率。
-- `train.batch_size`：批大小。
-- `train.early_stop`：早停耐心轮数。
+- `mynet.num_negatives`：`mynet` BPR 训练时每个正样本使用的随机负样本数。
+- `mynet.use_rerank`：是否启用 learned rerank 后处理。
 - `train.train_candidates`：训练时每条样本的候选数量。
 - `train.val_candidates`：本地验证 MRR 的候选数量。
+- `train.tune_val_samples`：用于验证和 rerank 调参的验证样本数。
 - `submission.seed`：一键提交时使用的随机种子。
+
+`submission.py` 还内置了数据集级策略：dataset1 默认使用 `blend_mode: auto`，dataset2 默认使用 `blend_mode: none`。
 
 命令行参数会覆盖 `configs/default.yaml` 中的默认值。
 
@@ -127,9 +130,8 @@ models/
 
 outputs/
 ├── logs/
-│   ├── train/
-│   ├── check_data/
-│   └── check_submission/
+│   ├── dataset1_*.log
+│   └── dataset2_*.log
 └── submission/
     ├── dataset1.csv
     ├── dataset2.csv
@@ -179,4 +181,9 @@ python scripts/run.py check-submission
 
 ## 实验结果
 
-当前工程会在训练日志中记录每轮训练 loss、本地验证 MRR、融合权重和最终预测范围。正式实验结果可根据 `outputs/logs/train/` 中的日志补充到此处。
+当前工程会在训练日志中记录每轮训练 loss、本地验证 MRR/AP/AUC、rerank holdout 提升和最终预测范围。已验证的简单改动如下：
+
+- baseline：test.csv 得分约 `1.0111`。
+- `mynet.use_rerank: true`：test.csv 得分约 `1.240`，是当前收益最大的改动。
+- `mynet.num_negatives: 100`：test.csv 得分约 `1.0682`，单独有小幅提升。
+- `objective: sampled_softmax` + `selection_metric: MRR`：test.csv 得分约 `0.5534`，效果较差，当前不推荐。

@@ -30,8 +30,8 @@ Thumbs.db
 
 # Local tooling files
 .codex
+.agents
+AGENTS.md
 
 # Internal planning docs
 docs/
-
-AGENTS.md

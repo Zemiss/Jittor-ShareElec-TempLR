@@ -15,10 +15,23 @@ from .config import (
     load_default_config,
     parse_config_path,
 )
-from .core import TemporalFeatureStore, install_tee, row_minmax
+from .core import CandidateSampler, TemporalFeatureStore, candidate_ranking_metrics, install_tee
 from .models import build_model
 from .runtime import configure_jittor_backend, seed_everything, test_competition
-from .training import display_path, is_baseline_family
+from .training import (
+    display_path,
+    is_baseline_family,
+    apply_learned_rerank_on_uncertain_rows,
+    predict_learned_rerank_scores,
+    reranker_path,
+    resolve_mynet_rerank,
+    save_learned_reranker,
+    split_rerank_validation,
+    train_learned_reranker,
+    tune_learned_rerank_policy,
+    format_rerank_summary,
+    uses_bpr_objective,
+)
 
 
 def resolve_model_defaults(config, argv=None):
@@ -38,7 +51,18 @@ def build_parser(config, argv=None):
     parser.add_argument('--config', type=str, default=parse_config_path())
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--data_dir', type=str, default=get(config, 'paths', 'data_dir', './data_A'))
-    parser.add_argument('--save_dir', type=str, default=get(config, 'paths', 'model_dir', './models'))
+    parser.add_argument(
+        '--save_model_dir',
+        '--save_dir',
+        dest='save_model_dir',
+        type=str,
+        default=get(config, 'paths', 'save_model_dir', get(config, 'paths', 'model_dir', './models')),
+    )
+    parser.add_argument(
+        '--use_model_dir',
+        type=str,
+        default=get(config, 'paths', 'use_model_dir', get(config, 'paths', 'model_dir', './models')),
+    )
     parser.add_argument('--output_dir', type=str, default=get(config, 'paths', 'submission_dir', './outputs/submission'))
     parser.add_argument('--prediction_file', type=str, default='')
     parser.add_argument('--checkpoint', type=str, default='')
@@ -47,8 +71,20 @@ def build_parser(config, argv=None):
     parser.add_argument('--seed', type=int, default=common.get('seed', 1))
     parser.add_argument('--blend_mode', type=str, default=train.get('blend_mode', 'none'), choices=['auto', 'none'])
     parser.add_argument('--blend_alpha', type=float, default=train.get('blend_alpha', -1.0))
+    parser.add_argument('--objective', type=str, default=model_cfg.get('objective', train.get('objective', 'bpr')))
+    parser.add_argument('--tune_val_samples', type=int, default=train.get('tune_val_samples', 5000))
+    parser.add_argument('--val_candidates', type=int, default=train.get('val_candidates', 100))
     parser.add_argument('--heuristic_decay', type=float, default=train.get('heuristic_decay', 0.0))
-    parser.add_argument('--mynet_heuristic_alpha', type=float, default=train.get('mynet_heuristic_alpha', 1.0))
+    parser.add_argument(
+        '--use_rerank',
+        type=as_bool,
+        default=as_bool(model_cfg.get('use_rerank', train.get('use_rerank', False))),
+    )
+    parser.add_argument(
+        '--rerank_margin',
+        type=float,
+        default=model_cfg.get('rerank_margin', train.get('rerank_margin', 0.05)),
+    )
     parser.add_argument('--log_dir', type=str, default=get(config, 'paths', 'log_dir', './outputs/logs'))
     parser.add_argument('--num_neighbors', type=int, default=model_cfg.get('num_neighbors', 30))
     parser.add_argument('--hidden_size', type=int, default=model_cfg.get('hidden_size', 64))
@@ -75,6 +111,46 @@ def build_parser(config, argv=None):
     return parser
 
 
+def predict_candidate_scores(
+    jt,
+    model,
+    model_name,
+    objective,
+    src,
+    times,
+    candidates,
+    neighbor_sampler,
+    num_neighbors,
+    batch_size,
+    feature_store=None,
+    desc='Testing',
+):
+    if uses_bpr_objective(model_name, objective):
+        return test_baseline_competition(
+            jt,
+            model,
+            src,
+            times,
+            candidates,
+            neighbor_sampler,
+            num_neighbors,
+            batch_size,
+            desc=desc,
+        )
+    return test_competition(
+        jt,
+        model,
+        src,
+        times,
+        candidates,
+        neighbor_sampler,
+        num_neighbors,
+        batch_size,
+        desc=desc,
+        feature_store=feature_store,
+    )
+
+
 def write_prediction(path, scores):
     parent = osp.dirname(path)
     if parent:
@@ -97,7 +173,7 @@ def main(argv=None):
     seed_everything(args.seed, jt)
 
     log_name = f'{args.dataset}_{datetime.now().strftime("%m%d_%H%M")}.log'
-    install_tee(osp.join(args.log_dir, 'test', log_name))
+    install_tee(osp.join(args.log_dir, log_name))
 
     model_name = args.model_name.lower()
     model_tag = model_name.upper()
@@ -135,20 +211,23 @@ def main(argv=None):
     model = build_model(args, node_size)
     model.set_min_idx(src_min, dst_min)
 
-    checkpoint = args.checkpoint or osp.join(args.save_dir, f'{args.dataset}_{model_tag}_best.pkl')
+    checkpoint = args.checkpoint or osp.join(args.use_model_dir, f'{args.dataset}_{model_tag}_best.pkl')
     if not osp.exists(checkpoint):
         raise FileNotFoundError(f'Checkpoint not found: {checkpoint}')
     model.load_state_dict(jt.load(checkpoint))
     print(f'Loaded model from {checkpoint}')
 
     baseline_family = is_baseline_family(model_name)
+    bpr_objective = uses_bpr_objective(model_name, args.objective)
+    mynet_rerank_enabled = resolve_mynet_rerank(args)
     feature_store = None
     needs_features = (
         not baseline_family
         and (
-            getattr(model, 'supports_pair_features', False)
+            (not bpr_objective)
+            or getattr(model, 'supports_pair_features', False)
             or args.blend_mode == 'auto'
-            or (model_name == 'mynet' and args.mynet_heuristic_alpha < 1.0)
+            or (model_name == 'mynet' and mynet_rerank_enabled)
         )
     )
     if needs_features:
@@ -160,35 +239,133 @@ def main(argv=None):
             max_co_items=args.max_co_items,
         )
 
-    if baseline_family:
-        scores = test_baseline_competition(
-            jt,
-            model,
-            test_src,
-            test_time,
-            test_candidates,
-            full_neighbor_sampler,
-            args.num_neighbors,
-            args.batch_size,
+    reranker = None
+    if model_name == 'mynet' and mynet_rerank_enabled:
+        num_total = len(train_df)
+        num_val = int(num_total * 0.15)
+        num_train = num_total - num_val
+        val_len = len(src_np) - num_train
+        val_eval_size = min(args.tune_val_samples, val_len)
+        if val_eval_size <= 0:
+            raise ValueError('Validation split is empty; cannot train reranker')
+
+        val_eval_idx = np.linspace(0, val_len - 1, val_eval_size, dtype=np.int64)
+        val_src_eval = src_np[num_train:][val_eval_idx]
+        val_dst_eval = dst_np[num_train:][val_eval_idx]
+        val_time_eval = t_np[num_train:][val_eval_idx]
+
+        val_feature_store = TemporalFeatureStore(
+            src_np[:num_train],
+            dst_np[:num_train],
+            t_np[:num_train],
+            decay_scale=args.heuristic_decay,
+            max_co_items=args.max_co_items,
         )
-    else:
-        scores = test_competition(
-            jt,
-            model,
-            test_src,
-            test_time,
-            test_candidates,
-            full_neighbor_sampler,
-            args.num_neighbors,
-            args.batch_size,
-            feature_store=feature_store,
+        val_sampler = CandidateSampler(
+            src_np[:num_train],
+            dst_np[:num_train],
+            t_np[:num_train],
+            val_feature_store,
+            seed=args.seed,
+        )
+        val_candidates = val_sampler.sample(
+            val_src_eval,
+            val_dst_eval,
+            val_time_eval,
+            num_candidates=args.val_candidates,
         )
 
-    if model_name == 'mynet' and args.mynet_heuristic_alpha < 1.0:
-        alpha = min(max(args.mynet_heuristic_alpha, 0.0), 1.0)
-        print(f'Blending mynet scores with temporal heuristic (alpha={alpha:.2f})...')
-        heuristic_scores = feature_store.heuristic_score(test_src, test_time, test_candidates)
-        scores = alpha * row_minmax(scores) + (1.0 - alpha) * heuristic_scores
+        print('\nRerank: training validation ranker...')
+        val_neural_scores = predict_candidate_scores(
+            jt,
+            model,
+            model_name,
+            args.objective,
+            val_src_eval,
+            val_time_eval,
+            val_candidates,
+            full_neighbor_sampler,
+            args.num_neighbors,
+            args.batch_size,
+            feature_store=val_feature_store,
+            desc='Rerank val',
+        )
+        rerank_train_slice, rerank_holdout_slice = split_rerank_validation(len(val_src_eval))
+        reranker = train_learned_reranker(
+            val_feature_store,
+            val_src_eval[rerank_train_slice],
+            val_time_eval[rerank_train_slice],
+            val_candidates[rerank_train_slice],
+            val_neural_scores[rerank_train_slice],
+        )
+        learned_reranker_path = reranker_path(args.save_model_dir, args.dataset, model_tag)
+        save_learned_reranker(reranker, learned_reranker_path)
+
+        learned_val_scores = predict_learned_rerank_scores(
+            reranker,
+            val_feature_store,
+            val_src_eval[rerank_holdout_slice],
+            val_time_eval[rerank_holdout_slice],
+            val_candidates[rerank_holdout_slice],
+            val_neural_scores[rerank_holdout_slice],
+        )
+        holdout_neural_scores = val_neural_scores[rerank_holdout_slice]
+        rerank_policy = tune_learned_rerank_policy(holdout_neural_scores, learned_val_scores)
+        reranker.rerank_alpha = rerank_policy['alpha']
+        reranker.rerank_margin = rerank_policy['margin']
+        reranker.rerank_coverage = rerank_policy['coverage']
+        save_learned_reranker(reranker, learned_reranker_path)
+        gated_val_scores = rerank_policy['scores']
+        val_rerank_mask = rerank_policy['mask']
+        neural_val_metrics = candidate_ranking_metrics(holdout_neural_scores)
+        gated_val_metrics = candidate_ranking_metrics(gated_val_scores)
+        print(format_rerank_summary(
+            'Rerank holdout',
+            neural_val_metrics,
+            gated_val_metrics,
+            val_rerank_mask,
+            reranker.rerank_alpha,
+            reranker.rerank_margin,
+            reranker.rerank_coverage,
+        ))
+
+    scores = predict_candidate_scores(
+        jt,
+        model,
+        model_name,
+        args.objective,
+        test_src,
+        test_time,
+        test_candidates,
+        full_neighbor_sampler,
+        args.num_neighbors,
+        args.batch_size,
+        feature_store=feature_store,
+        desc='Predict',
+    )
+
+    if model_name == 'mynet' and mynet_rerank_enabled:
+        learned_scores = predict_learned_rerank_scores(
+            reranker,
+            feature_store,
+            test_src,
+            test_time,
+            test_candidates,
+            scores,
+        )
+        scores, rerank_mask = apply_learned_rerank_on_uncertain_rows(
+            scores,
+            learned_scores,
+            getattr(reranker, 'rerank_margin', args.rerank_margin),
+            alpha=getattr(reranker, 'rerank_alpha', 0.0),
+            coverage=getattr(reranker, 'rerank_coverage', None),
+        )
+        print(
+            f'Rerank test: applied {int(rerank_mask.sum())}/{len(rerank_mask)} '
+            f'({100.0 * rerank_mask.mean():.1f}%), '
+            f'alpha={getattr(reranker, "rerank_alpha", 0.0):.2f}, '
+            f'margin={getattr(reranker, "rerank_margin", args.rerank_margin):.4f}'
+        )
 
     output_file = args.prediction_file or osp.join(args.output_dir, f'{args.dataset}.csv')
     write_prediction(output_file, scores)

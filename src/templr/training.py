@@ -1,6 +1,7 @@
 import argparse
 import os
 import os.path as osp
+import pickle
 from datetime import datetime
 
 import numpy as np
@@ -19,6 +20,7 @@ from .baseline import test_baseline_competition, train_baseline
 from .core import (
     CandidateSampler,
     TemporalFeatureStore,
+    candidate_ranking_metrics,
     install_tee,
     mean_reciprocal_rank,
     row_minmax,
@@ -58,6 +60,190 @@ def uses_bpr_objective(model_name, objective):
 
 def normalize_selection_metric(value):
     return ''.join(ch for ch in str(value).upper() if ch.isalnum())
+
+
+def resolve_mynet_rerank(args):
+    return bool(getattr(args, 'use_rerank', False))
+
+
+def learned_rerank_matrix(feature_store, src, t, candidates, neural_scores):
+    features = feature_store.candidate_matrix(src, t, candidates)
+    neural_norm = row_minmax(neural_scores)
+    num_rows, num_candidates = neural_norm.shape
+    flat_features = features.reshape(num_rows * num_candidates, features.shape[-1])
+    return np.concatenate(
+        [
+            neural_norm.reshape(-1, 1),
+            flat_features,
+        ],
+        axis=1,
+    )
+
+
+def train_learned_reranker(feature_store, src, t, candidates, neural_scores):
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    x = learned_rerank_matrix(feature_store, src, t, candidates, neural_scores)
+    num_candidates = candidates.shape[1]
+    row_x = x.reshape(len(src), num_candidates, x.shape[-1])
+    pos_x = row_x[:, :1, :]
+    neg_x = row_x[:, 1:, :]
+    pos_minus_neg = (pos_x - neg_x).reshape(-1, x.shape[-1])
+    neg_minus_pos = -pos_minus_neg
+    x_pair = np.vstack([pos_minus_neg, neg_minus_pos])
+    y = np.concatenate(
+        [
+            np.ones(len(pos_minus_neg), dtype=np.int32),
+            np.zeros(len(neg_minus_pos), dtype=np.int32),
+        ]
+    )
+    model = make_pipeline(
+        StandardScaler(),
+        LogisticRegression(
+            fit_intercept=False,
+            max_iter=300,
+            solver='lbfgs',
+            random_state=0,
+        ),
+    )
+    model.fit(x_pair, y)
+    model.rerank_alpha = 0.0
+    model.rerank_margin = 0.0
+    return model
+
+
+def predict_learned_rerank_scores(model, feature_store, src, t, candidates, neural_scores, batch_rows=10000):
+    scores = np.empty_like(neural_scores, dtype=np.float32)
+    for start in range(0, len(src), int(batch_rows)):
+        end = min(start + int(batch_rows), len(src))
+        x = learned_rerank_matrix(
+            feature_store,
+            src[start:end],
+            t[start:end],
+            candidates[start:end],
+            neural_scores[start:end],
+        )
+        if hasattr(model, 'decision_function'):
+            chunk_scores = model.decision_function(x).reshape(end - start, candidates.shape[1])
+        else:
+            chunk_scores = model.predict_proba(x)[:, 1].reshape(end - start, candidates.shape[1])
+        scores[start:end] = chunk_scores.astype(np.float32)
+    return row_minmax(scores)
+
+
+def apply_learned_rerank_on_uncertain_rows(neural_scores, learned_scores, margin, alpha=0.0, coverage=None):
+    neural_norm = row_minmax(neural_scores)
+    learned_norm = row_minmax(learned_scores)
+    margin = float(margin)
+    alpha = min(max(float(alpha), 0.0), 1.0)
+    if margin < 0:
+        scores = alpha * neural_norm + (1.0 - alpha) * learned_norm
+        return scores, np.ones(neural_norm.shape[0], dtype=bool)
+    if neural_norm.shape[1] < 2:
+        mask = np.ones(neural_norm.shape[0], dtype=bool)
+    else:
+        sorted_scores = np.sort(neural_norm, axis=1)
+        top_margin = sorted_scores[:, -1] - sorted_scores[:, -2]
+        if coverage is None:
+            mask = top_margin < margin
+        else:
+            keep_rows = int(round(float(coverage) * neural_norm.shape[0]))
+            keep_rows = min(max(keep_rows, 1), neural_norm.shape[0])
+            selected = np.argpartition(top_margin, keep_rows - 1)[:keep_rows]
+            mask = np.zeros(neural_norm.shape[0], dtype=bool)
+            mask[selected] = True
+    scores = neural_norm.copy()
+    scores[mask] = alpha * neural_norm[mask] + (1.0 - alpha) * learned_norm[mask]
+    return scores, mask
+
+
+def tune_learned_rerank_policy(neural_scores, learned_scores):
+    neural_norm = row_minmax(neural_scores)
+    learned_norm = row_minmax(learned_scores)
+    best = None
+    margins = [-1.0, 0.0001, 0.001, 0.005, 0.01, 0.02, 0.05, 0.10]
+    alphas = np.linspace(0.0, 0.9, 10)
+    for margin in margins:
+        for alpha in alphas:
+            scores, mask = apply_learned_rerank_on_uncertain_rows(
+                neural_norm,
+                learned_norm,
+                margin,
+                alpha=alpha,
+            )
+            if not mask.any():
+                continue
+            mrr = mean_reciprocal_rank(scores)
+            if best is None or mrr > best['mrr']:
+                best = {
+                    'mrr': mrr,
+                    'alpha': float(alpha),
+                    'margin': float(margin),
+                    'coverage': float(mask.mean()),
+                    'scores': scores,
+                    'mask': mask,
+                }
+    if best is None:
+        scores, mask = apply_learned_rerank_on_uncertain_rows(
+            neural_norm,
+            learned_norm,
+            -1.0,
+            alpha=0.0,
+        )
+        best = {
+            'mrr': mean_reciprocal_rank(scores),
+            'alpha': 0.0,
+            'margin': -1.0,
+            'coverage': 1.0,
+            'scores': scores,
+            'mask': mask,
+        }
+    return best
+
+
+def split_rerank_validation(num_rows, train_ratio=0.8):
+    num_rows = int(num_rows)
+    if num_rows < 2:
+        raise ValueError('Rerank validation needs at least two rows for train/holdout split')
+    split = int(num_rows * float(train_ratio))
+    split = min(max(split, 1), num_rows - 1)
+    return slice(0, split), slice(split, num_rows)
+
+
+def format_rerank_summary(prefix, before_metrics, after_metrics, mask, alpha, margin, coverage=None):
+    mrr_before = before_metrics['MRR']
+    mrr_after = after_metrics['MRR']
+    ap_before = before_metrics['AP100']
+    ap_after = after_metrics['AP100']
+    delta = mrr_after - mrr_before
+    rel = 100.0 * delta / max(abs(mrr_before), 1e-12)
+    applied = int(mask.sum())
+    total = len(mask)
+    coverage_text = f', coverage={100.0 * float(coverage):.1f}%' if coverage is not None else ''
+    return (
+        f'{prefix}: MRR {mrr_before:.6f} -> {mrr_after:.6f} '
+        f'({delta:+.6f}, {rel:+.2f}%), '
+        f'AP100 {ap_before:.6f} -> {ap_after:.6f}; '
+        f'applied {applied}/{total} ({100.0 * applied / max(total, 1):.1f}%), '
+        f'alpha={alpha:.2f}, margin={margin:.4f}{coverage_text}'
+    )
+
+
+def reranker_path(save_dir, dataset, model_tag):
+    return osp.join(save_dir, 'reranker', f'{dataset}_{model_tag}_reranker.pkl')
+
+
+def save_learned_reranker(model, path):
+    os.makedirs(osp.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        pickle.dump(model, f)
+
+
+def load_learned_reranker(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 
 def assert_left_history_only(full_neighbor_sampler, node_ids, query_times, num_neighbors, label, max_rows=256):
@@ -103,8 +289,21 @@ def build_parser(config, argv=None):
     parser.add_argument('--config', type=str, default=parse_config_path())
     parser.add_argument('--dataset', type=str, required=True, help='Dataset name')
     parser.add_argument('--data_dir', type=str, default=get(config, 'paths', 'data_dir', './data_A'), help='Data directory')
-    parser.add_argument('--save_dir', type=str, default=get(config, 'paths', 'model_dir', './models'), help='Model save directory')
+    parser.add_argument(
+        '--save_model_dir',
+        '--save_dir',
+        dest='save_model_dir',
+        type=str,
+        default=get(config, 'paths', 'save_model_dir', get(config, 'paths', 'model_dir', './models')),
+        help='Model save directory',
+    )
     parser.add_argument('--output_dir', type=str, default=get(config, 'paths', 'output_dir', './outputs'), help='Output directory')
+    parser.add_argument(
+        '--submission_dir',
+        type=str,
+        default=get(config, 'paths', 'submission_dir', './outputs/submission'),
+        help='Submission output directory',
+    )
     parser.add_argument('--prediction_file', type=str, default='', help='Write prediction CSV to this exact path')
     parser.add_argument('--epochs', type=int, default=model_cfg.get('epochs', train_cfg.get('epochs', 100)), help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=model_cfg.get('batch_size', train_cfg.get('batch_size', 200)), help='Batch size')
@@ -134,7 +333,16 @@ def build_parser(config, argv=None):
     )
     parser.add_argument('--heuristic_decay', type=float, default=train_cfg.get('heuristic_decay', 0.0))
     parser.add_argument('--binary_aux_weight', type=float, default=train_cfg.get('binary_aux_weight', 0.0))
-    parser.add_argument('--mynet_heuristic_alpha', type=float, default=train_cfg.get('mynet_heuristic_alpha', 1.0))
+    parser.add_argument(
+        '--use_rerank',
+        type=as_bool,
+        default=as_bool(model_cfg.get('use_rerank', train_cfg.get('use_rerank', False))),
+    )
+    parser.add_argument(
+        '--rerank_margin',
+        type=float,
+        default=model_cfg.get('rerank_margin', train_cfg.get('rerank_margin', 0.05)),
+    )
     parser.add_argument('--num_negatives', type=int, default=model_cfg.get('num_negatives', 1))
     parser.add_argument('--log_dir', type=str, default=get(config, 'paths', 'log_dir', './outputs/logs'))
     parser.add_argument('--seed', type=int, default=common.get('seed', 1), help='Random seed')
@@ -235,6 +443,7 @@ def main(argv=None):
 
     baseline_family = is_baseline_family(model_name)
     bpr_objective = uses_bpr_objective(model_name, args.objective)
+    mynet_rerank_enabled = resolve_mynet_rerank(args)
 
     bpr_num_negatives = max(1, int(args.num_negatives if model_name == 'mynet' else 1))
 
@@ -298,19 +507,19 @@ def main(argv=None):
         )
 
     if bpr_objective:
-        val_feature_store = None
+        val_feature_store = TemporalFeatureStore(
+            src_np[:num_train],
+            dst_np[:num_train],
+            t_np[:num_train],
+            decay_scale=args.heuristic_decay,
+            max_co_items=args.max_co_items,
+        )
         val_heuristic_scores = None
         val_sampler = CandidateSampler(
             src_np[:num_train],
             dst_np[:num_train],
             t_np[:num_train],
-            TemporalFeatureStore(
-                src_np[:num_train],
-                dst_np[:num_train],
-                t_np[:num_train],
-                decay_scale=args.heuristic_decay,
-                max_co_items=args.max_co_items,
-            ),
+            val_feature_store,
             seed=args.seed,
         )
         val_candidates = val_sampler.sample(
@@ -358,7 +567,7 @@ def main(argv=None):
         weight_decay=args.weight_decay,
     )
 
-    save_path = args.save_dir
+    save_path = args.save_model_dir
     os.makedirs(save_path, exist_ok=True)
 
     print(
@@ -429,7 +638,7 @@ def main(argv=None):
             (not bpr_objective)
             or getattr(model, 'supports_pair_features', False)
             or args.blend_mode == 'auto'
-            or (model_name == 'mynet' and args.mynet_heuristic_alpha < 1.0)
+            or (model_name == 'mynet' and mynet_rerank_enabled)
         )
     )
     if needs_test_features:
@@ -441,6 +650,74 @@ def main(argv=None):
             max_co_items=args.max_co_items,
         )
 
+    learned_reranker = None
+    if model_name == 'mynet' and mynet_rerank_enabled:
+        print('\nRerank: training validation ranker...')
+        if best_val_neural_scores is None:
+            if bpr_objective:
+                best_val_neural_scores = test_baseline_competition(
+                    jt,
+                    model,
+                    val_src_eval,
+                    val_time_eval,
+                    val_candidates,
+                    full_neighbor_sampler,
+                    args.num_neighbors,
+                    args.batch_size,
+                    desc='Rerank val',
+                )
+            else:
+                best_val_neural_scores = test_competition(
+                    jt,
+                    model,
+                    val_src_eval,
+                    val_time_eval,
+                    val_candidates,
+                    full_neighbor_sampler,
+                    args.num_neighbors,
+                    args.batch_size,
+                    desc='Rerank val',
+                    feature_store=val_feature_store,
+                )
+
+        rerank_train_slice, rerank_holdout_slice = split_rerank_validation(len(val_src_eval))
+        learned_reranker = train_learned_reranker(
+            val_feature_store,
+            val_src_eval[rerank_train_slice],
+            val_time_eval[rerank_train_slice],
+            val_candidates[rerank_train_slice],
+            best_val_neural_scores[rerank_train_slice],
+        )
+        learned_reranker_path = reranker_path(save_path, args.dataset, model_tag)
+        save_learned_reranker(learned_reranker, learned_reranker_path)
+        learned_val_scores = predict_learned_rerank_scores(
+            learned_reranker,
+            val_feature_store,
+            val_src_eval[rerank_holdout_slice],
+            val_time_eval[rerank_holdout_slice],
+            val_candidates[rerank_holdout_slice],
+            best_val_neural_scores[rerank_holdout_slice],
+        )
+        holdout_neural_scores = best_val_neural_scores[rerank_holdout_slice]
+        rerank_policy = tune_learned_rerank_policy(holdout_neural_scores, learned_val_scores)
+        learned_reranker.rerank_alpha = rerank_policy['alpha']
+        learned_reranker.rerank_margin = rerank_policy['margin']
+        learned_reranker.rerank_coverage = rerank_policy['coverage']
+        save_learned_reranker(learned_reranker, learned_reranker_path)
+        gated_val_scores = rerank_policy['scores']
+        val_rerank_mask = rerank_policy['mask']
+        neural_val_metrics = candidate_ranking_metrics(holdout_neural_scores)
+        gated_val_metrics = candidate_ranking_metrics(gated_val_scores)
+        print(format_rerank_summary(
+            'Rerank holdout',
+            neural_val_metrics,
+            gated_val_metrics,
+            val_rerank_mask,
+            learned_reranker.rerank_alpha,
+            learned_reranker.rerank_margin,
+            learned_reranker.rerank_coverage,
+        ))
+
     if bpr_objective:
         neural_scores = test_baseline_competition(
             jt,
@@ -451,6 +728,7 @@ def main(argv=None):
             full_neighbor_sampler,
             args.num_neighbors,
             args.batch_size,
+            desc='Predict',
         )
     else:
         neural_scores = test_competition(
@@ -465,11 +743,31 @@ def main(argv=None):
             feature_store=test_feature_store,
         )
 
-    if model_name == 'mynet' and args.mynet_heuristic_alpha < 1.0:
-        alpha = min(max(args.mynet_heuristic_alpha, 0.0), 1.0)
-        print(f'\nBlending mynet scores with temporal heuristic (alpha={alpha:.2f})...')
-        heuristic_scores = test_feature_store.heuristic_score(test_src, test_time, test_candidates)
-        scores = alpha * row_minmax(neural_scores) + (1.0 - alpha) * heuristic_scores
+    if model_name == 'mynet' and mynet_rerank_enabled:
+        print('\nApplying learned mynet reranker...')
+        if learned_reranker is None:
+            raise RuntimeError('Learned reranker was not trained before test prediction')
+        learned_scores = predict_learned_rerank_scores(
+            learned_reranker,
+            test_feature_store,
+            test_src,
+            test_time,
+            test_candidates,
+            neural_scores,
+        )
+        scores, test_rerank_mask = apply_learned_rerank_on_uncertain_rows(
+            neural_scores,
+            learned_scores,
+            getattr(learned_reranker, 'rerank_margin', args.rerank_margin),
+            alpha=getattr(learned_reranker, 'rerank_alpha', 0.0),
+            coverage=getattr(learned_reranker, 'rerank_coverage', None),
+        )
+        print(
+            f'Rerank test: applied {int(test_rerank_mask.sum())}/{len(test_rerank_mask)} '
+            f'({100.0 * test_rerank_mask.mean():.1f}%), '
+            f'alpha={getattr(learned_reranker, "rerank_alpha", 0.0):.2f}, '
+            f'margin={getattr(learned_reranker, "rerank_margin", args.rerank_margin):.4f}'
+        )
     elif not baseline_family and args.blend_mode == 'auto':
         print('\nBuilding temporal heuristic scores...')
         heuristic_scores = test_feature_store.heuristic_score(test_src, test_time, test_candidates)
@@ -507,7 +805,7 @@ def main(argv=None):
 
     print(f'Scores shape: {scores.shape}, range: [{scores.min():.6f}, {scores.max():.6f}]')
 
-    output_file = args.prediction_file or f'{args.output_dir}/{args.dataset}/{args.dataset}_result.csv'
+    output_file = args.prediction_file or osp.join(args.submission_dir, f'{args.dataset}.csv')
     output_parent = osp.dirname(output_file)
     if output_parent:
         os.makedirs(output_parent, exist_ok=True)

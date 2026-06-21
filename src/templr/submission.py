@@ -59,7 +59,13 @@ def build_parser(config, argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default=parse_config_path())
     parser.add_argument('--data_dir', type=str, default=get(config, 'paths', 'data_dir', './data_A'))
-    parser.add_argument('--save_dir', type=str, default=get(config, 'paths', 'model_dir', './models'))
+    parser.add_argument(
+        '--save_model_dir',
+        '--save_dir',
+        dest='save_model_dir',
+        type=str,
+        default=get(config, 'paths', 'save_model_dir', get(config, 'paths', 'model_dir', './models')),
+    )
     parser.add_argument('--submission_dir', type=str, default=get(config, 'paths', 'submission_dir', './outputs/submission'))
     parser.add_argument('--zip_name', type=str, default=submit.get('zip_name', 'result.zip'))
     parser.add_argument('--datasets', type=str, nargs='+', default=config.get('datasets', ['dataset1', 'dataset2']))
@@ -90,7 +96,16 @@ def build_parser(config, argv=None):
     )
     parser.add_argument('--heuristic_decay', type=float, default=train.get('heuristic_decay', 0.0))
     parser.add_argument('--binary_aux_weight', type=float, default=train.get('binary_aux_weight', 0.0))
-    parser.add_argument('--mynet_heuristic_alpha', type=float, default=train.get('mynet_heuristic_alpha', 1.0))
+    parser.add_argument(
+        '--use_rerank',
+        type=as_bool,
+        default=as_bool(model_cfg.get('use_rerank', train.get('use_rerank', False))),
+    )
+    parser.add_argument(
+        '--rerank_margin',
+        type=float,
+        default=model_cfg.get('rerank_margin', train.get('rerank_margin', 0.05)),
+    )
     parser.add_argument('--num_negatives', type=int, default=model_cfg.get('num_negatives', 1))
     parser.add_argument('--model_name', type=str, default=model_name, choices=['baseline', 'mynet'])
     parser.add_argument('--dropout', type=float, default=model_cfg.get('dropout', 0.1))
@@ -143,7 +158,7 @@ def main(argv=None):
             '--config', args.config,
             '--dataset', ds,
             '--data_dir', args.data_dir,
-            '--save_dir', args.save_dir,
+            '--save_model_dir', args.save_model_dir,
             '--prediction_file', dst_file,
             '--epochs', str(args.epochs),
             '--batch_size', str(args.batch_size),
@@ -159,7 +174,8 @@ def main(argv=None):
             '--extra_eval_metrics', str(args.extra_eval_metrics),
             '--heuristic_decay', str(strategy['heuristic_decay']),
             '--binary_aux_weight', str(args.binary_aux_weight),
-            '--mynet_heuristic_alpha', str(args.mynet_heuristic_alpha),
+            '--use_rerank', str(args.use_rerank),
+            '--rerank_margin', str(args.rerank_margin),
             '--num_negatives', str(args.num_negatives),
             '--model_name', args.model_name,
             '--dropout', str(args.dropout),

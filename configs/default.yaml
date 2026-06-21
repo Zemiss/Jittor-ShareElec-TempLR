@@ -9,13 +9,14 @@ run:
 
 paths:
   data_dir: ./data_A
-  model_dir: ./models
+  save_model_dir: ./models
+  use_model_dir: ./models
   output_dir: ./outputs
   submission_dir: ./outputs/submission
   log_dir: ./outputs/logs
 
 common:
-  seed: 2411273
+  seed: 
   use_cuda: 1
 
 mynet:
@@ -30,7 +31,8 @@ mynet:
   weight_decay: 0.0
   objective: bpr
   selection_metric: AP
-  num_negatives: 50
+  num_negatives: 1
+  use_rerank: true
 
 baseline:
   num_neighbors: 30
@@ -44,7 +46,6 @@ baseline:
   weight_decay: 0.0
   objective: bpr
   selection_metric: AP
-  num_negatives: 1
 
 train:
   extra_eval_metrics: true
