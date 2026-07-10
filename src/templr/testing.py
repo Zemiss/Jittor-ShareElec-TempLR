@@ -15,7 +15,14 @@ from .config import (
     load_default_config,
     parse_config_path,
 )
-from .core import CandidateSampler, TemporalFeatureStore, candidate_ranking_metrics, install_tee
+from .core import (
+    CandidateSampler,
+    TemporalFeatureStore,
+    candidate_ranking_metrics,
+    candidate_slice_metrics,
+    format_slice_metrics,
+    install_tee,
+)
 from .models import build_model
 from .runtime import configure_jittor_backend, seed_everything, test_competition
 from .training import (
@@ -30,6 +37,10 @@ from .training import (
     train_learned_reranker,
     tune_learned_rerank_policy,
     format_rerank_summary,
+    format_reranker_weights,
+    normalize_rerank_feature_set,
+    parse_rerank_dual_head,
+    resolve_rerank_dual_head,
     uses_bpr_objective,
 )
 
@@ -85,6 +96,23 @@ def build_parser(config, argv=None):
         type=float,
         default=model_cfg.get('rerank_margin', train.get('rerank_margin', 0.05)),
     )
+    parser.add_argument(
+        '--rerank_dual_head',
+        type=parse_rerank_dual_head,
+        default=parse_rerank_dual_head(model_cfg.get('rerank_dual_head', 'auto')),
+    )
+    parser.add_argument(
+        '--rerank_regularization',
+        type=float,
+        default=model_cfg.get('rerank_regularization', 1.0),
+    )
+    parser.add_argument(
+        '--rerank_feature_set',
+        type=normalize_rerank_feature_set,
+        default=normalize_rerank_feature_set(model_cfg.get('rerank_feature_set', 'enhanced')),
+        choices=['basic', 'enhanced'],
+    )
+    parser.add_argument('--validation_only', type=as_bool, default=False)
     parser.add_argument('--log_dir', type=str, default=get(config, 'paths', 'log_dir', './outputs/logs'))
     parser.add_argument('--num_neighbors', type=int, default=model_cfg.get('num_neighbors', 30))
     parser.add_argument('--hidden_size', type=int, default=model_cfg.get('hidden_size', 64))
@@ -164,6 +192,7 @@ def main(argv=None):
     config_path = parse_config_path(argv)
     config = load_default_config(config_path)
     args = build_parser(config, argv).parse_args(argv)
+    args.rerank_dual_head = resolve_rerank_dual_head(args.dataset, args.rerank_dual_head)
     configure_jittor_backend(args.use_cuda)
 
     import jittor as jt
@@ -297,7 +326,11 @@ def main(argv=None):
             val_time_eval[rerank_train_slice],
             val_candidates[rerank_train_slice],
             val_neural_scores[rerank_train_slice],
+            dual_head=args.rerank_dual_head,
+            regularization=args.rerank_regularization,
+            feature_set=args.rerank_feature_set,
         )
+        print(format_reranker_weights(reranker))
         learned_reranker_path = reranker_path(args.save_model_dir, args.dataset, model_tag)
         save_learned_reranker(reranker, learned_reranker_path)
 
@@ -328,6 +361,31 @@ def main(argv=None):
             reranker.rerank_margin,
             reranker.rerank_coverage,
         ))
+        print(format_slice_metrics(
+            'Rerank holdout neural slices',
+            candidate_slice_metrics(
+                holdout_neural_scores,
+                val_feature_store,
+                val_src_eval[rerank_holdout_slice],
+                val_time_eval[rerank_holdout_slice],
+                val_candidates[rerank_holdout_slice],
+            ),
+        ))
+
+        print(format_slice_metrics(
+            'Rerank holdout upgraded slices',
+            candidate_slice_metrics(
+                gated_val_scores,
+                val_feature_store,
+                val_src_eval[rerank_holdout_slice],
+                val_time_eval[rerank_holdout_slice],
+                val_candidates[rerank_holdout_slice],
+            ),
+        ))
+
+        if args.validation_only:
+            print('Validation-only mode: skipped test prediction.')
+            return gated_val_metrics
 
     scores = predict_candidate_scores(
         jt,

@@ -76,9 +76,30 @@ def row_minmax(scores):
 
 
 class TemporalFeatureStore:
-    """Strictly time-aware features for candidate link ranking."""
+    """Strictly left-looking temporal and pair features for candidate ranking."""
 
-    FEATURE_DIM = 12
+    FEATURE_NAMES = (
+        'pair_seen',
+        'pair_recency',
+        'pair_count_log',
+        'dst_recency',
+        'dst_count_log',
+        'src_history_items_log',
+        'dst_sources_log',
+        'co_item_ratio',
+        'co_item_strength',
+        'pair_recent_rank',
+        'pair_is_last_item',
+        'pair_source_share',
+        'pair_log_gap',
+        'dst_log_gap',
+        'pair_recent_frequency',
+        'dst_recent_frequency_log',
+        'pair_gap_stability',
+        'pair_mean_gap_log',
+        'temporal_co_strength',
+    )
+    FEATURE_DIM = len(FEATURE_NAMES)
 
     def __init__(self, src, dst, t, decay_scale=0.0, max_co_items=20):
         self.pair_times = defaultdict(list)
@@ -88,6 +109,8 @@ class TemporalFeatureStore:
         self.src_item_sets = defaultdict(set)
         self.dst_source_sets = defaultdict(set)
         self.max_co_items = int(max_co_items)
+        self._co_strength_cache = {}
+        self._co_strength_cache_limit = 250000
 
         for src_i, dst_i, time_i in zip(src, dst, t):
             src_i = int(src_i)
@@ -114,6 +137,9 @@ class TemporalFeatureStore:
             time_span = max(int(np.max(t)) - int(np.min(t)), 1)
         else:
             time_span = 1
+        self.max_time = int(np.max(t)) if len(t) else -1
+        self.time_span = float(time_span)
+        self.log_time_span = float(np.log1p(time_span))
         self.decay_scale = float(decay_scale) if decay_scale > 0 else max(time_span / 50.0, 1.0)
 
     def _prefix(self, history, query_time):
@@ -126,6 +152,32 @@ class TemporalFeatureStore:
         delta = max(int(query_time) - history[idx - 1], 0)
         return float(np.exp(-delta / self.decay_scale)), idx
 
+    def _history_features(self, history, query_time, include_intervals=True):
+        """Return bounded TAMI-style gap features using events strictly before query_time."""
+        idx = self._prefix(history, query_time)
+        if idx == 0:
+            return 0.0, 0, 0.0, 0.0, 0.0, 0.0
+
+        query_time = int(query_time)
+        delta = max(query_time - history[idx - 1], 0)
+        recency = float(np.exp(-delta / self.decay_scale))
+        log_gap = float(np.log1p(delta) / max(self.log_time_span, 1e-12))
+        window_start = query_time - self.decay_scale
+        recent_start = bisect_left(history, window_start, 0, idx)
+        recent_frequency = float(idx - recent_start) / max(idx, 1)
+
+        stability = 0.0
+        mean_gap_log = 0.0
+        if include_intervals and idx >= 2:
+            recent_history = np.asarray(history[max(0, idx - 6):idx], dtype=np.float64)
+            gaps = np.diff(recent_history)
+            mean_gap = float(np.mean(gaps))
+            gap_cv = float(np.std(gaps) / max(mean_gap, 1.0))
+            stability = 1.0 / (1.0 + gap_cv)
+            mean_gap_log = float(np.log1p(mean_gap) / max(self.log_time_span, 1e-12))
+
+        return recency, idx, log_gap, recent_frequency, stability, mean_gap_log
+
     def source_history_items(self, src, query_time):
         items = []
         for dst_i, history in self.src_dst_times.get(int(src), {}).items():
@@ -134,6 +186,9 @@ class TemporalFeatureStore:
         return items
 
     def source_recent_items(self, src, query_time, max_items=None):
+        return [dst_i for _, dst_i in self.source_recent_history(src, query_time, max_items)]
+
+    def source_recent_history(self, src, query_time, max_items=None):
         items = []
         for dst_i, history in self.src_dst_times.get(int(src), {}).items():
             idx = self._prefix(history, query_time)
@@ -142,28 +197,77 @@ class TemporalFeatureStore:
         items.sort(reverse=True)
         if max_items is not None and max_items > 0:
             items = items[:max_items]
-        return [dst_i for _, dst_i in items]
+        return items
 
-    def candidate_matrix(self, src, t, candidates):
-        features = np.zeros((*candidates.shape, self.FEATURE_DIM), dtype=np.float32)
+    def _active_sources(self, dst, query_time):
+        sources = self.dst_source_sets.get(int(dst), set())
+        if int(query_time) > self.max_time:
+            return sources
+        return {
+            src_i
+            for src_i in sources
+            if self._prefix(self.src_dst_times[src_i][int(dst)], query_time) > 0
+        }
+
+    def _common_source_strength(self, left_dst, right_dst, query_time):
+        left_dst = int(left_dst)
+        right_dst = int(right_dst)
+        key = (left_dst, right_dst) if left_dst <= right_dst else (right_dst, left_dst)
+        fully_observed = int(query_time) > self.max_time
+        if fully_observed and key in self._co_strength_cache:
+            return self._co_strength_cache[key]
+
+        left_sources = self._active_sources(left_dst, query_time)
+        right_sources = self._active_sources(right_dst, query_time)
+        if not left_sources or not right_sources:
+            value = 0.0
+        else:
+            common_sources = len(left_sources & right_sources)
+            value = float(np.log1p(min(common_sources, 1000))) if common_sources else 0.0
+
+        if fully_observed:
+            if len(self._co_strength_cache) >= self._co_strength_cache_limit:
+                self._co_strength_cache.clear()
+            self._co_strength_cache[key] = value
+        return value
+
+    def candidate_matrix(self, src, t, candidates, feature_set='enhanced'):
+        feature_set = str(feature_set).strip().lower()
+        if feature_set not in {'basic', 'enhanced'}:
+            raise ValueError(f'Unknown temporal feature set: {feature_set}')
+        enhanced = feature_set == 'enhanced'
+        feature_dim = self.FEATURE_DIM if enhanced else 12
+        features = np.zeros((*candidates.shape, feature_dim), dtype=np.float32)
 
         for row_idx, (src_i, time_i) in enumerate(zip(src, t)):
             src_i = int(src_i)
             time_i = int(time_i)
-            recent_items = self.source_recent_items(src_i, time_i, self.max_co_items)
+            recent_history = self.source_recent_history(src_i, time_i, self.max_co_items)
+            recent_items = [dst_i for _, dst_i in recent_history]
             recent_rank = {int(dst_i): rank for rank, dst_i in enumerate(recent_items)}
+            recent_item_weights = {
+                int(dst_i): float(np.exp(-max(time_i - int(last_time), 0) / self.decay_scale))
+                for last_time, dst_i in recent_history
+            }
             src_history_len = len(recent_items)
             src_event_count = self._prefix(self.src_times.get(src_i, []), time_i)
             for col_idx, dst_i in enumerate(candidates[row_idx]):
                 dst_i = int(dst_i)
-                pair_recency, pair_count = self._recency_and_count(
-                    self.pair_times.get((src_i, dst_i), []),
-                    time_i,
-                )
-                dst_recency, dst_count = self._recency_and_count(
-                    self.dst_times.get(dst_i, []),
-                    time_i,
-                )
+                pair_history = self.pair_times.get((src_i, dst_i), [])
+                dst_history = self.dst_times.get(dst_i, [])
+                if enhanced:
+                    pair_recency, pair_count, pair_log_gap, pair_recent_frequency, pair_gap_stability, pair_mean_gap_log = self._history_features(
+                        pair_history,
+                        time_i,
+                    )
+                    dst_recency, dst_count, dst_log_gap, dst_recent_frequency, _, _ = self._history_features(
+                        dst_history,
+                        time_i,
+                        include_intervals=False,
+                    )
+                else:
+                    pair_recency, pair_count = self._recency_and_count(pair_history, time_i)
+                    dst_recency, dst_count = self._recency_and_count(dst_history, time_i)
 
                 features[row_idx, col_idx, 0] = 1.0 if pair_count > 0 else 0.0
                 features[row_idx, col_idx, 1] = pair_recency
@@ -171,21 +275,20 @@ class TemporalFeatureStore:
                 features[row_idx, col_idx, 3] = dst_recency
                 features[row_idx, col_idx, 4] = np.log1p(dst_count)
 
-                cand_sources = self.dst_source_sets.get(dst_i, set())
                 co_hits = 0
                 co_strength = 0.0
+                temporal_co_strength = 0.0
                 for hist_dst in recent_items:
-                    hist_sources = self.dst_source_sets.get(hist_dst, set())
-                    if not hist_sources or not cand_sources:
-                        continue
-                    common_sources = len(cand_sources & hist_sources)
-                    if common_sources > 0:
+                    common_strength = self._common_source_strength(dst_i, hist_dst, time_i)
+                    if common_strength > 0:
                         co_hits += 1
-                        co_strength += np.log1p(min(common_sources, 1000))
+                        co_strength += common_strength
+                        if enhanced:
+                            temporal_co_strength += recent_item_weights[hist_dst] * common_strength
 
                 denom = max(src_history_len, 1)
                 features[row_idx, col_idx, 5] = np.log1p(src_history_len)
-                features[row_idx, col_idx, 6] = np.log1p(len(cand_sources))
+                features[row_idx, col_idx, 6] = np.log1p(len(self._active_sources(dst_i, time_i)))
                 features[row_idx, col_idx, 7] = co_hits / denom
                 features[row_idx, col_idx, 8] = co_strength / denom
                 if dst_i in recent_rank:
@@ -193,11 +296,19 @@ class TemporalFeatureStore:
                     features[row_idx, col_idx, 9] = 1.0 / float(rank + 1)
                     features[row_idx, col_idx, 10] = 1.0 if rank == 0 else 0.0
                 features[row_idx, col_idx, 11] = pair_count / max(src_event_count, 1)
+                if enhanced:
+                    features[row_idx, col_idx, 12] = pair_log_gap
+                    features[row_idx, col_idx, 13] = dst_log_gap
+                    features[row_idx, col_idx, 14] = pair_recent_frequency
+                    features[row_idx, col_idx, 15] = np.log1p(dst_count * dst_recent_frequency)
+                    features[row_idx, col_idx, 16] = pair_gap_stability
+                    features[row_idx, col_idx, 17] = pair_mean_gap_log
+                    features[row_idx, col_idx, 18] = temporal_co_strength / denom
 
         return features
 
     def heuristic_score(self, src, t, candidates):
-        features = self.candidate_matrix(src, t, candidates)
+        features = self.candidate_matrix(src, t, candidates, feature_set='basic')
         scores = (
             2.0 * features[:, :, 0]
             + 4.0 * features[:, :, 1]
@@ -294,17 +405,67 @@ def mean_reciprocal_rank(scores, positive_col=0):
 
 def candidate_ranking_metrics(scores, positive_col=0):
     scores = row_minmax(scores)
+    rr = reciprocal_rank(scores, positive_col)
+    ranks = 1.0 / rr
     y_true = np.zeros_like(scores, dtype=np.int32)
     y_true[:, positive_col] = 1
     ap100 = float(average_precision_score(y_true.ravel(), scores.ravel()))
     auc100 = float(roc_auc_score(y_true.ravel(), scores.ravel()))
     return {
-        'MRR': mean_reciprocal_rank(scores, positive_col),
+        'MRR': float(np.mean(rr)),
+        'Hits@1': float(np.mean(ranks <= 1.0)),
+        'Hits@3': float(np.mean(ranks <= 3.0)),
+        'Hits@10': float(np.mean(ranks <= 10.0)),
+        'MedianRank': float(np.median(ranks)),
         'AP100': ap100,
         'AUC100': auc100,
         'AP': ap100,
         'AUC': auc100,
     }
+
+
+def candidate_slice_metrics(scores, feature_store, src, t, candidates, positive_col=0):
+    """MRR diagnostics for the repeat/new, gap and popularity slices in develop.md."""
+    scores = np.asarray(scores)
+    positive_candidates = candidates[:, positive_col:positive_col + 1]
+    positive_features = feature_store.candidate_matrix(src, t, positive_candidates)[:, 0, :]
+    rr = reciprocal_rank(scores, positive_col)
+    seen = positive_features[:, 0] > 0.5
+    slices = {
+        'overall': np.ones(len(rr), dtype=bool),
+        'repeat': seen,
+        'novel': ~seen,
+    }
+
+    if seen.any():
+        seen_gap = positive_features[seen, 12]
+        gap_split = float(np.median(seen_gap))
+        slices['short_gap'] = seen & (positive_features[:, 12] <= gap_split)
+        slices['long_gap'] = seen & (positive_features[:, 12] > gap_split)
+
+    popularity = positive_features[:, 4]
+    popularity_split = float(np.median(popularity))
+    slices['head'] = popularity > popularity_split
+    slices['tail'] = popularity <= popularity_split
+
+    result = {}
+    for name, mask in slices.items():
+        count = int(mask.sum())
+        result[name] = {
+            'count': count,
+            'MRR': float(np.mean(rr[mask])) if count else float('nan'),
+        }
+    return result
+
+
+def format_slice_metrics(prefix, metrics):
+    parts = []
+    for name in ('overall', 'repeat', 'novel', 'short_gap', 'long_gap', 'head', 'tail'):
+        if name not in metrics:
+            continue
+        value = metrics[name]
+        parts.append(f'{name}={value["MRR"]:.6f}(n={value["count"]})')
+    return f'{prefix}: ' + ', '.join(parts)
 
 
 def tune_blend_alpha(neural_scores, heuristic_scores):
@@ -366,6 +527,12 @@ def check_dataset(data_dir: str, dataset: str) -> None:
 
     train_rows = len(train_df)
     dup_ratio = 1.0 - (len(train_df[['src', 'dst', 'time']].drop_duplicates()) / max(1, train_rows))
+    pair_repeat_ratio = float(train_df[['src', 'dst']].duplicated().mean())
+    src_nodes = set(train_df['src'].unique())
+    dst_nodes = set(train_df['dst'].unique())
+    type_overlap = len(src_nodes & dst_nodes)
+    type_overlap_ratio = type_overlap / max(min(len(src_nodes), len(dst_nodes)), 1)
+    graph_type = 'bipartite' if type_overlap == 0 else 'homogeneous/overlapping'
 
     print(f'[{dataset}]')
     print(f'  train rows: {train_rows}')
@@ -374,6 +541,8 @@ def check_dataset(data_dir: str, dataset: str) -> None:
     print(f'  unique dst: {train_df["dst"].nunique()}')
     print(f'  train time range: [{int(train_df["time"].min())}, {int(train_df["time"].max())}]')
     print(f'  duplicate ratio (src,dst,time): {dup_ratio:.4f}')
+    print(f'  repeat interaction ratio (src,dst): {pair_repeat_ratio:.4f}')
+    print(f'  graph type: {graph_type} (src/dst overlap={type_overlap_ratio:.4f})')
     print('  status: OK')
 
 

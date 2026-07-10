@@ -6,6 +6,7 @@ import zipfile
 
 from .config import as_bool, get, get_model_config, get_run_model_name, load_default_config, parse_config_path
 from .core import check_dataset, check_one_submission_file
+from .training import normalize_rerank_feature_set, parse_rerank_dual_head
 
 
 DEFAULT_DATASET_STRATEGIES = {
@@ -13,11 +14,13 @@ DEFAULT_DATASET_STRATEGIES = {
         'blend_mode': 'auto',
         'blend_alpha': -1.0,
         'heuristic_decay': 0.0,
+        'rerank_dual_head': True,
     },
     'dataset2': {
         'blend_mode': 'none',
         'blend_alpha': 1.0,
         'heuristic_decay': 0.0,
+        'rerank_dual_head': False,
     },
 }
 
@@ -35,6 +38,8 @@ def resolve_strategy(dataset, args):
         strategy['blend_alpha'] = args.blend_alpha
     if args.heuristic_decay > 0:
         strategy['heuristic_decay'] = args.heuristic_decay
+    if args.rerank_dual_head is not None:
+        strategy['rerank_dual_head'] = args.rerank_dual_head
     return strategy
 
 
@@ -106,6 +111,22 @@ def build_parser(config, argv=None):
         type=float,
         default=model_cfg.get('rerank_margin', train.get('rerank_margin', 0.05)),
     )
+    parser.add_argument(
+        '--rerank_dual_head',
+        type=parse_rerank_dual_head,
+        default=parse_rerank_dual_head(model_cfg.get('rerank_dual_head', 'auto')),
+    )
+    parser.add_argument(
+        '--rerank_regularization',
+        type=float,
+        default=model_cfg.get('rerank_regularization', 1.0),
+    )
+    parser.add_argument(
+        '--rerank_feature_set',
+        type=normalize_rerank_feature_set,
+        default=normalize_rerank_feature_set(model_cfg.get('rerank_feature_set', 'enhanced')),
+        choices=['basic', 'enhanced'],
+    )
     parser.add_argument('--num_negatives', type=int, default=model_cfg.get('num_negatives', 1))
     parser.add_argument('--model_name', type=str, default=model_name, choices=['baseline', 'mynet'])
     parser.add_argument('--dropout', type=float, default=model_cfg.get('dropout', 0.1))
@@ -176,6 +197,9 @@ def main(argv=None):
             '--binary_aux_weight', str(args.binary_aux_weight),
             '--use_rerank', str(args.use_rerank),
             '--rerank_margin', str(args.rerank_margin),
+            '--rerank_dual_head', str(strategy['rerank_dual_head']),
+            '--rerank_regularization', str(args.rerank_regularization),
+            '--rerank_feature_set', args.rerank_feature_set,
             '--num_negatives', str(args.num_negatives),
             '--model_name', args.model_name,
             '--dropout', str(args.dropout),

@@ -21,6 +21,8 @@ from .core import (
     CandidateSampler,
     TemporalFeatureStore,
     candidate_ranking_metrics,
+    candidate_slice_metrics,
+    format_slice_metrics,
     install_tee,
     mean_reciprocal_rank,
     row_minmax,
@@ -66,26 +68,89 @@ def resolve_mynet_rerank(args):
     return bool(getattr(args, 'use_rerank', False))
 
 
-def learned_rerank_matrix(feature_store, src, t, candidates, neural_scores):
-    features = feature_store.candidate_matrix(src, t, candidates)
+def normalize_rerank_feature_set(value):
+    feature_set = str(value).strip().lower()
+    if feature_set not in {'basic', 'enhanced'}:
+        raise ValueError(f'Unknown rerank feature set: {value}')
+    return feature_set
+
+
+def parse_rerank_dual_head(value):
+    if value is None or str(value).strip().lower() == 'auto':
+        return None
+    return as_bool(value)
+
+
+def resolve_rerank_dual_head(dataset, value):
+    if value is not None:
+        return bool(value)
+    return str(dataset).strip().lower() != 'dataset2'
+
+
+def learned_rerank_feature_names(dual_head=True, feature_set='enhanced'):
+    feature_set = normalize_rerank_feature_set(feature_set)
+    temporal_names = TemporalFeatureStore.FEATURE_NAMES
+    if feature_set == 'basic':
+        temporal_names = temporal_names[:12]
+    base_names = ('neural_score',) + temporal_names
+    if not dual_head:
+        return base_names
+    return (
+        tuple(f'repeat:{name}' for name in base_names)
+        + tuple(f'novel:{name}' for name in base_names)
+        + ('repeat_gate',)
+    )
+
+
+def learned_rerank_matrix(
+    feature_store,
+    src,
+    t,
+    candidates,
+    neural_scores,
+    dual_head=True,
+    feature_set='enhanced',
+):
+    feature_set = normalize_rerank_feature_set(feature_set)
+    features = feature_store.candidate_matrix(src, t, candidates, feature_set=feature_set)
     neural_norm = row_minmax(neural_scores)
     num_rows, num_candidates = neural_norm.shape
     flat_features = features.reshape(num_rows * num_candidates, features.shape[-1])
+    base = np.concatenate([neural_norm.reshape(-1, 1), flat_features], axis=1)
+    if not dual_head:
+        return base
+
+    repeat_gate = flat_features[:, 0:1]
+    novel_gate = 1.0 - repeat_gate
     return np.concatenate(
-        [
-            neural_norm.reshape(-1, 1),
-            flat_features,
-        ],
+        [base * repeat_gate, base * novel_gate, repeat_gate],
         axis=1,
     )
 
 
-def train_learned_reranker(feature_store, src, t, candidates, neural_scores):
+def train_learned_reranker(
+    feature_store,
+    src,
+    t,
+    candidates,
+    neural_scores,
+    dual_head=True,
+    regularization=1.0,
+    feature_set='enhanced',
+):
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
-    x = learned_rerank_matrix(feature_store, src, t, candidates, neural_scores)
+    x = learned_rerank_matrix(
+        feature_store,
+        src,
+        t,
+        candidates,
+        neural_scores,
+        dual_head=dual_head,
+        feature_set=feature_set,
+    )
     num_candidates = candidates.shape[1]
     row_x = x.reshape(len(src), num_candidates, x.shape[-1])
     pos_x = row_x[:, :1, :]
@@ -102,6 +167,7 @@ def train_learned_reranker(feature_store, src, t, candidates, neural_scores):
     model = make_pipeline(
         StandardScaler(),
         LogisticRegression(
+            C=max(float(regularization), 1e-6),
             fit_intercept=False,
             max_iter=300,
             solver='lbfgs',
@@ -111,6 +177,9 @@ def train_learned_reranker(feature_store, src, t, candidates, neural_scores):
     model.fit(x_pair, y)
     model.rerank_alpha = 0.0
     model.rerank_margin = 0.0
+    model.rerank_dual_head = bool(dual_head)
+    model.rerank_feature_set = normalize_rerank_feature_set(feature_set)
+    model.feature_names_ = learned_rerank_feature_names(dual_head, feature_set)
     return model
 
 
@@ -124,6 +193,8 @@ def predict_learned_rerank_scores(model, feature_store, src, t, candidates, neur
             t[start:end],
             candidates[start:end],
             neural_scores[start:end],
+            dual_head=bool(getattr(model, 'rerank_dual_head', False)),
+            feature_set=getattr(model, 'rerank_feature_set', 'basic'),
         )
         if hasattr(model, 'decision_function'):
             chunk_scores = model.decision_function(x).reshape(end - start, candidates.shape[1])
@@ -162,9 +233,16 @@ def apply_learned_rerank_on_uncertain_rows(neural_scores, learned_scores, margin
 def tune_learned_rerank_policy(neural_scores, learned_scores):
     neural_norm = row_minmax(neural_scores)
     learned_norm = row_minmax(learned_scores)
-    best = None
+    best = {
+        'mrr': mean_reciprocal_rank(neural_norm),
+        'alpha': 1.0,
+        'margin': -1.0,
+        'coverage': 1.0,
+        'scores': neural_norm,
+        'mask': np.ones(neural_norm.shape[0], dtype=bool),
+    }
     margins = [-1.0, 0.0001, 0.001, 0.005, 0.01, 0.02, 0.05, 0.10]
-    alphas = np.linspace(0.0, 0.9, 10)
+    alphas = np.linspace(0.0, 1.0, 11)
     for margin in margins:
         for alpha in alphas:
             scores, mask = apply_learned_rerank_on_uncertain_rows(
@@ -176,7 +254,7 @@ def tune_learned_rerank_policy(neural_scores, learned_scores):
             if not mask.any():
                 continue
             mrr = mean_reciprocal_rank(scores)
-            if best is None or mrr > best['mrr']:
+            if mrr > best['mrr']:
                 best = {
                     'mrr': mrr,
                     'alpha': float(alpha),
@@ -185,21 +263,6 @@ def tune_learned_rerank_policy(neural_scores, learned_scores):
                     'scores': scores,
                     'mask': mask,
                 }
-    if best is None:
-        scores, mask = apply_learned_rerank_on_uncertain_rows(
-            neural_norm,
-            learned_norm,
-            -1.0,
-            alpha=0.0,
-        )
-        best = {
-            'mrr': mean_reciprocal_rank(scores),
-            'alpha': 0.0,
-            'margin': -1.0,
-            'coverage': 1.0,
-            'scores': scores,
-            'mask': mask,
-        }
     return best
 
 
@@ -217,6 +280,14 @@ def format_rerank_summary(prefix, before_metrics, after_metrics, mask, alpha, ma
     mrr_after = after_metrics['MRR']
     ap_before = before_metrics['AP100']
     ap_after = after_metrics['AP100']
+    hits1_before = before_metrics['Hits@1']
+    hits1_after = after_metrics['Hits@1']
+    hits3_before = before_metrics['Hits@3']
+    hits3_after = after_metrics['Hits@3']
+    hits10_before = before_metrics['Hits@10']
+    hits10_after = after_metrics['Hits@10']
+    median_before = before_metrics['MedianRank']
+    median_after = after_metrics['MedianRank']
     delta = mrr_after - mrr_before
     rel = 100.0 * delta / max(abs(mrr_before), 1e-12)
     applied = int(mask.sum())
@@ -225,10 +296,27 @@ def format_rerank_summary(prefix, before_metrics, after_metrics, mask, alpha, ma
     return (
         f'{prefix}: MRR {mrr_before:.6f} -> {mrr_after:.6f} '
         f'({delta:+.6f}, {rel:+.2f}%), '
+        f'Hits@1 {hits1_before:.6f} -> {hits1_after:.6f}, '
+        f'Hits@3 {hits3_before:.6f} -> {hits3_after:.6f}, '
+        f'Hits@10 {hits10_before:.6f} -> {hits10_after:.6f}, '
+        f'MedianRank {median_before:.1f} -> {median_after:.1f}, '
         f'AP100 {ap_before:.6f} -> {ap_after:.6f}; '
         f'applied {applied}/{total} ({100.0 * applied / max(total, 1):.1f}%), '
         f'alpha={alpha:.2f}, margin={margin:.4f}{coverage_text}'
     )
+
+
+def format_reranker_weights(model, top_k=10):
+    names = tuple(getattr(model, 'feature_names_', ()))
+    try:
+        coefficients = model.named_steps['logisticregression'].coef_[0]
+    except (AttributeError, KeyError):
+        return 'Rerank feature weights: unavailable'
+    if len(names) != len(coefficients):
+        names = tuple(f'feature_{idx}' for idx in range(len(coefficients)))
+    order = np.argsort(np.abs(coefficients))[::-1][:int(top_k)]
+    summary = ', '.join(f'{names[idx]}={coefficients[idx]:+.3f}' for idx in order)
+    return f'Rerank top feature weights: {summary}'
 
 
 def reranker_path(save_dir, dataset, model_tag):
@@ -343,6 +431,22 @@ def build_parser(config, argv=None):
         type=float,
         default=model_cfg.get('rerank_margin', train_cfg.get('rerank_margin', 0.05)),
     )
+    parser.add_argument(
+        '--rerank_dual_head',
+        type=parse_rerank_dual_head,
+        default=parse_rerank_dual_head(model_cfg.get('rerank_dual_head', 'auto')),
+    )
+    parser.add_argument(
+        '--rerank_regularization',
+        type=float,
+        default=model_cfg.get('rerank_regularization', 1.0),
+    )
+    parser.add_argument(
+        '--rerank_feature_set',
+        type=normalize_rerank_feature_set,
+        default=normalize_rerank_feature_set(model_cfg.get('rerank_feature_set', 'enhanced')),
+        choices=['basic', 'enhanced'],
+    )
     parser.add_argument('--num_negatives', type=int, default=model_cfg.get('num_negatives', 1))
     parser.add_argument('--log_dir', type=str, default=get(config, 'paths', 'log_dir', './outputs/logs'))
     parser.add_argument('--seed', type=int, default=common.get('seed', 1), help='Random seed')
@@ -392,6 +496,7 @@ def main(argv=None):
     from jittor_geometric.dataloader.temporal_dataloader import TemporalDataLoader, get_neighbor_sampler
 
     args = build_parser(config, argv).parse_args(argv)
+    args.rerank_dual_head = resolve_rerank_dual_head(args.dataset, args.rerank_dual_head)
     jt.flags.use_cuda = args.use_cuda
     seed_everything(args.seed, jt)
 
@@ -687,7 +792,11 @@ def main(argv=None):
             val_time_eval[rerank_train_slice],
             val_candidates[rerank_train_slice],
             best_val_neural_scores[rerank_train_slice],
+            dual_head=args.rerank_dual_head,
+            regularization=args.rerank_regularization,
+            feature_set=args.rerank_feature_set,
         )
+        print(format_reranker_weights(learned_reranker))
         learned_reranker_path = reranker_path(save_path, args.dataset, model_tag)
         save_learned_reranker(learned_reranker, learned_reranker_path)
         learned_val_scores = predict_learned_rerank_scores(
@@ -716,6 +825,26 @@ def main(argv=None):
             learned_reranker.rerank_alpha,
             learned_reranker.rerank_margin,
             learned_reranker.rerank_coverage,
+        ))
+        print(format_slice_metrics(
+            'Rerank holdout neural slices',
+            candidate_slice_metrics(
+                holdout_neural_scores,
+                val_feature_store,
+                val_src_eval[rerank_holdout_slice],
+                val_time_eval[rerank_holdout_slice],
+                val_candidates[rerank_holdout_slice],
+            ),
+        ))
+        print(format_slice_metrics(
+            'Rerank holdout upgraded slices',
+            candidate_slice_metrics(
+                gated_val_scores,
+                val_feature_store,
+                val_src_eval[rerank_holdout_slice],
+                val_time_eval[rerank_holdout_slice],
+                val_candidates[rerank_holdout_slice],
+            ),
         ))
 
     if bpr_objective:
